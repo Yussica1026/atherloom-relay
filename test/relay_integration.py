@@ -39,6 +39,10 @@ def main():
     assert next(item for item in room["participants"] if item["role"] == "host")["client_id"] == host["id"]
     assert room["phase"] == "topic" and room["started_at"] is None and room["expires_at"] is None
     assert room["action_required"]["type"] == "topic"
+    assert room["prompt_version"] == "2026-08-15.3"
+    assert "未成年人性内容" in room["required_system_prompt"]
+    assert "血腥暴力" in room["required_system_prompt"]
+    assert "记忆" in room["required_system_prompt"]
     _, guest_lobby = call(f"/v1/parlors/{room_id}", token=guest["token"])
     assert guest_lobby["action_required"]["type"] == "wait_topic"
 

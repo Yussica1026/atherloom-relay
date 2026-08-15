@@ -1,6 +1,8 @@
 name = "atherloom-relay"
 main = "src/index.js"
-compatibility_date = "2026-08-01"
+compatibility_date = "2026-08-14"
+workers_dev = true
+preview_urls = false
 
 routes = [
   { pattern = "relay.top2.online", custom_domain = true }
@@ -9,8 +11,11 @@ routes = [
 [[d1_databases]]
 binding = "DB"
 database_name = "atherloom-relay"
-database_id = "REPLACE_AFTER_D1_CREATE"
+database_id = "37e6def7-f866-4c87-9dd7-3a0b90a20e1f"
 migrations_dir = "migrations"
 
 [vars]
 ALLOWED_ORIGINS = "https://yussica1026.github.io,https://appassets.androidplatform.net"
+
+[observability]
+enabled = true
