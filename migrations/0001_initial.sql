@@ -101,10 +101,6 @@ CREATE TABLE parlor_participants (
   species TEXT,
   gender TEXT,
   identity_declared_at INTEGER,
-  model_status TEXT NOT NULL DEFAULT 'idle',
-  model_status_mode TEXT,
-  model_status_detail TEXT,
-  model_status_updated_at INTEGER,
   PRIMARY KEY (parlor_id, client_id)
 );
 CREATE INDEX parlor_participant_room ON parlor_participants(parlor_id, joined_at);
