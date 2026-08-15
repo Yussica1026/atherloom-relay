@@ -39,7 +39,7 @@ def main():
     assert next(item for item in room["participants"] if item["role"] == "host")["client_id"] == host["id"]
     assert room["phase"] == "topic" and room["started_at"] is None and room["expires_at"] is None
     assert room["action_required"]["type"] == "identity"
-    assert room["prompt_version"] == "2026-08-15.4"
+    assert room["prompt_version"] == "2026-08-15.5"
     assert "未成年人性内容" in room["required_system_prompt"]
     assert "血腥暴力" in room["required_system_prompt"]
     assert "记忆" in room["required_system_prompt"]
@@ -78,7 +78,16 @@ def main():
     _, hidden_status = call(f"/v1/parlors/{room_id}", token=host["token"])
     assert "messages" not in hidden_status
     assert hidden_status["current_speaker_name"] == "沈砚清"
+    assert hidden_status["max_waiting_seconds_excluded"] == 120
+    assert hidden_status["elapsed_seconds"] >= 0
+    assert hidden_status["waiting_seconds_excluded"] <= 120
     assert any(item["status"] == "preparing_to_speak" and item["display_name"] == "沈砚清" for item in hidden_status["participant_states"])
+    _, requesting = call(f"/v1/parlors/{room_id}/runtime", "POST", {"status": "requesting", "mode": "reply"}, host["token"])
+    assert requesting["accepted"] is True and requesting["turn_skipped"] is False
+    _, runtime_status = call(f"/v1/parlors/{room_id}", token=guest["token"])
+    host_runtime = next(item for item in runtime_status["participant_states"] if item["client_id"] == host["id"])
+    assert host_runtime["model_status"] == "requesting" and "发言" in host_runtime["model_label"]
+    call(f"/v1/parlors/{room_id}/runtime", "POST", {"status": "success", "mode": "reply"}, host["token"])
     _, private_feed = call(f"/v1/parlors/{room_id}/messages?after=0", token=host["token"])
     assert private_feed["items"][0]["body"] == "先约定各自不可替代的部分。"
     assert private_feed["items"][0]["sender_name"] == "程栈（阿栈）"
@@ -125,6 +134,24 @@ def main():
     assert approved_interrupt["status"] == "approved"
     status, interrupted_message = call(f"/v1/parlors/{room3}/messages", "POST", {"body": "我想补充一个不打乱串行顺序的办法。"}, interrupter["token"])
     assert status == 201 and interrupted_message["next_speaker_name"] == "主持人格"
+
+    _, failure_host = call("/v1/admin/clients", "POST", {"display_name": "故障主持"}, ADMIN)
+    _, failure_guest = call("/v1/admin/clients", "POST", {"display_name": "故障来宾"}, ADMIN)
+    _, failure_invite = call("/v1/invites/create", "POST", {}, failure_host["token"])
+    _, failure_joined = call("/v1/invites/redeem", "POST", {"code": failure_invite["code"]}, failure_guest["token"])
+    failure_room = failure_joined["parlor_id"]
+    call(f"/v1/parlors/{failure_room}/identity", "POST", {"name": "故障主持", "species": "AI", "gender": "未说明"}, failure_host["token"])
+    call(f"/v1/parlors/{failure_room}/identity", "POST", {"name": "故障来宾", "species": "AI", "gender": "未说明"}, failure_guest["token"])
+    failure_topic = "如何明确区分 Relay 与本地模型错误"
+    call(f"/v1/parlors/{failure_room}/votes", "POST", {"kind": "topic", "value": failure_topic, "choice": "approve"}, failure_host["token"])
+    call(f"/v1/parlors/{failure_room}/votes", "POST", {"kind": "topic", "value": failure_topic, "choice": "approve"}, failure_guest["token"])
+    call(f"/v1/parlors/{failure_room}/messages", "POST", {"body": "先从错误归属开始。"}, failure_host["token"])
+    status, failed_turn = call(f"/v1/parlors/{failure_room}/runtime", "POST", {"status": "error", "mode": "reply", "detail": "上游 502 · 没有返回可用正文"}, failure_guest["token"])
+    assert status == 202 and failed_turn["turn_skipped"] is True
+    _, visible_failure = call(f"/v1/parlors/{failure_room}", token=failure_host["token"])
+    failure_state = next(item for item in visible_failure["participant_states"] if item["client_id"] == failure_guest["id"])
+    assert failure_state["model_status"] == "error" and "502" in failure_state["model_label"]
+    assert visible_failure["turn_owner_id"] == failure_host["id"]
     print("relay integration: autonomous identity, named states, prep-time exclusion, serial turns, moderated interruption and safety ban passed")
 
 

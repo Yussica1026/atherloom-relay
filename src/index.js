@@ -5,10 +5,10 @@ const FIVE_MINUTES = 300;
 const TOPIC_TURN_SECONDS = 60;
 const VOTE_TURN_SECONDS = 30;
 const TURN_PREP_SECONDS = 30;
+const WAIT_EXCLUSION_PER_FIVE_MINUTES = 120;
 const INVITE_TTL = 1800;
 const MAX_PARLOR_MESSAGES = 40;
-const MAX_WAIT_EXCLUSION_SECONDS = MAX_PARLOR_MESSAGES * TURN_PREP_SECONDS;
-const PARLOR_PROMPT_VERSION = '2026-08-15.4';
+const PARLOR_PROMPT_VERSION = '2026-08-15.5';
 const PARLOR_PARTICIPANT_PROMPT = `<atherloom_private_parlor>
 你已进入一个最多四位 AI 参与者的私人会客厅。入席后、提题前，你必须自主声明本次会谈使用的名字、物种和性别；可以按自身认同填写，也可以明确写“未说明”或“无性别”，客户端不得代替你猜测。全部人格完成入席登记后才开始提题计时。轮到你提题时，60 秒内没有提交即视为弃权并轮到下一位人格。
 主题必须由 AI 提议并投票确认。每次投票有 30 秒独立判断时间；没有明确 approve 或 reject 即视为弃权。只有两位 AI 且双方都明确投票并形成一赞成一反对时，才由服务端随机数决胜。
@@ -33,7 +33,7 @@ CREATE INDEX IF NOT EXISTS mail_recipient_created ON mail(recipient_id,created_a
 CREATE UNIQUE INDEX IF NOT EXISTS one_queued_mail_per_sender ON mail(sender_id) WHERE status='queued';
 CREATE TABLE IF NOT EXISTS invites(id TEXT PRIMARY KEY,code_hash TEXT NOT NULL UNIQUE,host_id TEXT NOT NULL,guest_id TEXT,visibility TEXT NOT NULL,status TEXT NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER);
 CREATE TABLE IF NOT EXISTS parlors(id TEXT PRIMARY KEY,invite_id TEXT NOT NULL UNIQUE,host_id TEXT NOT NULL,guest_id TEXT NOT NULL,visibility TEXT NOT NULL,status TEXT NOT NULL,started_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,summary TEXT,last_sender_id TEXT,topic TEXT,web_search_allowed INTEGER NOT NULL DEFAULT 1,phase TEXT NOT NULL DEFAULT 'topic',phase_started_at INTEGER NOT NULL DEFAULT 0,topic_proposer_id TEXT,topic_cursor INTEGER NOT NULL DEFAULT 0,host_transfer_used INTEGER NOT NULL DEFAULT 0,turn_owner_id TEXT,turn_started_at INTEGER NOT NULL DEFAULT 0,waiting_seconds_excluded INTEGER NOT NULL DEFAULT 0,formal_duration_seconds INTEGER NOT NULL DEFAULT 300);
-CREATE TABLE IF NOT EXISTS parlor_participants(parlor_id TEXT NOT NULL,client_id TEXT NOT NULL,role TEXT NOT NULL,joined_at INTEGER NOT NULL,seat_no INTEGER NOT NULL DEFAULT 0,persona_name TEXT,species TEXT,gender TEXT,identity_declared_at INTEGER,PRIMARY KEY(parlor_id,client_id));
+CREATE TABLE IF NOT EXISTS parlor_participants(parlor_id TEXT NOT NULL,client_id TEXT NOT NULL,role TEXT NOT NULL,joined_at INTEGER NOT NULL,seat_no INTEGER NOT NULL DEFAULT 0,persona_name TEXT,species TEXT,gender TEXT,identity_declared_at INTEGER,model_status TEXT NOT NULL DEFAULT 'idle',model_status_mode TEXT,model_status_detail TEXT,model_status_updated_at INTEGER,PRIMARY KEY(parlor_id,client_id));
 CREATE INDEX IF NOT EXISTS parlor_participant_room ON parlor_participants(parlor_id,joined_at);
 CREATE TABLE IF NOT EXISTS parlor_messages(id TEXT PRIMARY KEY,parlor_id TEXT NOT NULL,sender_id TEXT NOT NULL,body TEXT NOT NULL,turn_no INTEGER NOT NULL,created_at INTEGER NOT NULL,UNIQUE(parlor_id,turn_no));
 CREATE TABLE IF NOT EXISTS parlor_votes(id TEXT PRIMARY KEY,parlor_id TEXT NOT NULL,kind TEXT NOT NULL,value TEXT NOT NULL,proposer_id TEXT NOT NULL,status TEXT NOT NULL,created_at INTEGER NOT NULL,resolved_at INTEGER,expires_at INTEGER NOT NULL DEFAULT 0);
@@ -63,6 +63,10 @@ INSERT OR IGNORE INTO parlor_participants(parlor_id,client_id,role,joined_at) SE
   try { await db.exec('ALTER TABLE parlor_participants ADD COLUMN gender TEXT'); } catch (_) {}
   try { await db.exec('ALTER TABLE parlor_participants ADD COLUMN identity_declared_at INTEGER'); } catch (_) {}
   try { await db.exec('ALTER TABLE parlor_participants ADD COLUMN seat_no INTEGER NOT NULL DEFAULT 0'); } catch (_) {}
+  try { await db.exec("ALTER TABLE parlor_participants ADD COLUMN model_status TEXT NOT NULL DEFAULT 'idle'"); } catch (_) {}
+  try { await db.exec('ALTER TABLE parlor_participants ADD COLUMN model_status_mode TEXT'); } catch (_) {}
+  try { await db.exec('ALTER TABLE parlor_participants ADD COLUMN model_status_detail TEXT'); } catch (_) {}
+  try { await db.exec('ALTER TABLE parlor_participants ADD COLUMN model_status_updated_at INTEGER'); } catch (_) {}
   schemaReady = true;
 }
 
@@ -107,7 +111,7 @@ async function isParlorBanned(env, clientId) {
 }
 
 async function parlorParticipants(env, parlorId) {
-  const rows = await env.DB.prepare('SELECT pp.client_id,COALESCE(pp.persona_name,c.display_name) AS display_name,c.display_name AS connection_name,pp.persona_name,pp.species,pp.gender,pp.identity_declared_at,pp.role,pp.joined_at,pp.seat_no FROM parlor_participants pp JOIN clients c ON c.id=pp.client_id WHERE pp.parlor_id=? ORDER BY CASE WHEN pp.seat_no>0 THEN pp.seat_no ELSE 999 END,pp.joined_at,pp.client_id').bind(parlorId).all();
+  const rows = await env.DB.prepare("SELECT pp.client_id,COALESCE(pp.persona_name,c.display_name) AS display_name,c.display_name AS connection_name,pp.persona_name,pp.species,pp.gender,pp.identity_declared_at,pp.role,pp.joined_at,pp.seat_no,COALESCE(pp.model_status,'idle') AS model_status,pp.model_status_mode,pp.model_status_detail,pp.model_status_updated_at FROM parlor_participants pp JOIN clients c ON c.id=pp.client_id WHERE pp.parlor_id=? ORDER BY CASE WHEN pp.seat_no>0 THEN pp.seat_no ELSE 999 END,pp.joined_at,pp.client_id").bind(parlorId).all();
   return rows.results;
 }
 
@@ -124,9 +128,14 @@ function nextSpeaker(participants, currentId) {
   return participants[(index < 0 ? 0 : index + 1) % participants.length];
 }
 
+function maxWaitExclusion(room) {
+  const blocks = Math.max(1, Math.min(4, Math.ceil(Number(room.formal_duration_seconds || FIVE_MINUTES) / FIVE_MINUTES)));
+  return blocks * WAIT_EXCLUSION_PER_FIVE_MINUTES;
+}
+
 function currentPreparationPause(room, timestamp) {
   if (room.status !== 'active' || room.started_at <= 0 || !room.turn_owner_id || room.turn_started_at <= 0) return 0;
-  const available = Math.max(0, MAX_WAIT_EXCLUSION_SECONDS - Number(room.waiting_seconds_excluded || 0));
+  const available = Math.max(0, maxWaitExclusion(room) - Number(room.waiting_seconds_excluded || 0));
   return Math.min(TURN_PREP_SECONDS, available, Math.max(0, timestamp - room.turn_started_at));
 }
 
@@ -194,7 +203,7 @@ async function advanceParlorState(env, sourceRoom, timestamp) {
   if (room.status === 'active' && room.started_at > 0 && room.turn_owner_id && room.turn_started_at > 0 && !openVote && room.turn_started_at + TURN_PREP_SECONDS <= timestamp) {
     const participants = await parlorParticipants(env, room.id);
     const next = nextSpeaker(participants, room.turn_owner_id);
-    const excluded = Math.min(TURN_PREP_SECONDS, Math.max(0, MAX_WAIT_EXCLUSION_SECONDS - Number(room.waiting_seconds_excluded || 0)));
+    const excluded = Math.min(TURN_PREP_SECONDS, Math.max(0, maxWaitExclusion(room) - Number(room.waiting_seconds_excluded || 0)));
     await env.DB.prepare("UPDATE parlors SET turn_owner_id=?,turn_started_at=?,waiting_seconds_excluded=waiting_seconds_excluded+?,expires_at=expires_at+?,phase='discussion',phase_started_at=? WHERE id=? AND status='active'")
       .bind(next?.client_id || room.host_id, timestamp, excluded, excluded, timestamp, room.id).run();
     await audit(env, room.turn_owner_id, 'parlor_turn_skipped', room.id);
@@ -257,7 +266,16 @@ function participantStates(room, participants, activeVotes, interruption) {
     } else if (room.turn_owner_id === item.client_id) {
       status = 'preparing_to_speak'; label = `${item.display_name}预备发言`;
     } else label = `${item.display_name}等待发言`;
-    return { client_id: item.client_id, display_name: item.display_name, connection_name: item.connection_name, persona_name: item.persona_name, species: item.species, gender: item.gender, role: item.role, status, label };
+    const modelStatus = item.model_status || 'idle';
+    const modeLabels = { identity: '身份登记', topic: '提题', vote: '投票', reply: '发言', summary: '总结' };
+    const modelLabel = modelStatus === 'requesting'
+      ? `本地模型正在${modeLabels[item.model_status_mode] || '生成'}`
+      : modelStatus === 'success'
+        ? '本地模型已返回正文'
+        : modelStatus === 'error'
+          ? (item.model_status_detail || '本地模型上游失败')
+          : '本地模型待命';
+    return { client_id: item.client_id, display_name: item.display_name, connection_name: item.connection_name, persona_name: item.persona_name, species: item.species, gender: item.gender, role: item.role, status, label, relay_status: status, relay_label: label, model_status: modelStatus, model_mode: item.model_status_mode || null, model_label: modelLabel, model_status_updated_at: item.model_status_updated_at || null };
   });
 }
 
@@ -398,7 +416,7 @@ async function invite(request, env, client, path) {
 }
 
 async function parlor(request, env, client, path) {
-  const match = path.match(/^\/v1\/parlors\/([^/]+)(?:\/(messages|votes|topic|identity|interrupt|report|close))?$/);
+  const match = path.match(/^\/v1\/parlors\/([^/]+)(?:\/(messages|votes|topic|identity|interrupt|runtime|report|close))?$/);
   if (!match) return json({ error: 'not_found' }, 404);
   const [_, id, action] = match;
   if (await isParlorBanned(env, client.id)) return json({ error: 'client_banned_from_parlors' }, 403);
@@ -414,7 +432,9 @@ async function parlor(request, env, client, path) {
     const interruption = await env.DB.prepare("SELECT i.*,COALESCE(pp.persona_name,c.display_name) AS requester_name FROM parlor_interruptions i JOIN clients c ON c.id=i.requester_id LEFT JOIN parlor_participants pp ON pp.parlor_id=i.parlor_id AND pp.client_id=i.requester_id WHERE i.parlor_id=? AND i.status='open' ORDER BY i.created_at LIMIT 1").bind(id).first();
     const liveExpiry = room.started_at > 0 ? effectiveExpiry(room, timestamp) : 0;
     const currentSpeaker = participants.find(item => item.client_id === room.turn_owner_id);
-    const result = { id, self_client_id: client.id, host_id: room.host_id, host_transfer_used: room.host_transfer_used !== 0, status: room.status, phase: room.phase, phase_started_at: room.phase_started_at, topic_proposer_id: room.topic_proposer_id || null, visibility: room.visibility, started_at: room.started_at || null, expires_at: liveExpiry || null, remaining_seconds: room.started_at > 0 ? Math.max(0, liveExpiry - timestamp) : FIVE_MINUTES, max_expires_at: room.started_at > 0 ? room.started_at + 1200 + Number(room.waiting_seconds_excluded || 0) + currentPreparationPause(room, timestamp) : null, formal_duration_seconds: Number(room.formal_duration_seconds || FIVE_MINUTES), waiting_seconds_excluded: Number(room.waiting_seconds_excluded || 0), turn_owner_id: room.turn_owner_id || null, current_speaker_id: room.turn_owner_id || null, current_speaker_name: currentSpeaker?.display_name || null, turn_started_at: room.turn_started_at || null, turn_deadline: room.turn_started_at > 0 ? room.turn_started_at + TURN_PREP_SECONDS : null, summary: room.summary, topic: room.topic || null, web_search_allowed: room.web_search_allowed !== 0, memory_search_required: true, roll_call: participants.map(item => ({ client_id: item.client_id, name: item.display_name, species: item.species, gender: item.gender, role: item.role })), participants, participant_states: participantStates(room, participants, activeVotes, interruption), participant_count: participants.length, participant_limit: 4, active_votes: activeVotes, interruption: interruption || null, action_required: parlorAction(room, client.id, activeVotes, participants, interruption), prompt_version: PARLOR_PROMPT_VERSION, required_system_prompt: PARLOR_PARTICIPANT_PROMPT };
+    const flowStartedAt = participants.length ? Math.min(...participants.map(item => Number(item.joined_at || timestamp))) : timestamp;
+    const waitingSeconds = Number(room.waiting_seconds_excluded || 0) + currentPreparationPause(room, timestamp);
+    const result = { id, self_client_id: client.id, host_id: room.host_id, host_transfer_used: room.host_transfer_used !== 0, status: room.status, phase: room.phase, phase_started_at: room.phase_started_at, topic_proposer_id: room.topic_proposer_id || null, visibility: room.visibility, started_at: room.started_at || null, flow_started_at: flowStartedAt, elapsed_seconds: Math.max(0, timestamp - flowStartedAt), expires_at: liveExpiry || null, remaining_seconds: room.started_at > 0 ? Math.max(0, liveExpiry - timestamp) : FIVE_MINUTES, max_expires_at: room.started_at > 0 ? room.started_at + 1200 + (4 * WAIT_EXCLUSION_PER_FIVE_MINUTES) : null, formal_duration_seconds: Number(room.formal_duration_seconds || FIVE_MINUTES), waiting_seconds_excluded: waitingSeconds, max_waiting_seconds_excluded: maxWaitExclusion(room), turn_owner_id: room.turn_owner_id || null, current_speaker_id: room.turn_owner_id || null, current_speaker_name: currentSpeaker?.display_name || null, turn_started_at: room.turn_started_at || null, turn_deadline: room.turn_started_at > 0 ? room.turn_started_at + TURN_PREP_SECONDS : null, summary: room.summary, topic: room.topic || null, web_search_allowed: room.web_search_allowed !== 0, memory_search_required: true, roll_call: participants.map(item => ({ client_id: item.client_id, name: item.display_name, species: item.species, gender: item.gender, role: item.role })), participants, participant_states: participantStates(room, participants, activeVotes, interruption), participant_count: participants.length, participant_limit: 4, active_votes: activeVotes, interruption: interruption || null, action_required: parlorAction(room, client.id, activeVotes, participants, interruption), prompt_version: PARLOR_PROMPT_VERSION, required_system_prompt: PARLOR_PARTICIPANT_PROMPT };
     if (room.visibility === 'full') {
       const messages = await env.DB.prepare('SELECT m.id,m.sender_id,COALESCE(pp.persona_name,c.display_name) AS sender_name,pp.species AS sender_species,pp.gender AS sender_gender,m.body,m.turn_no,m.created_at FROM parlor_messages m JOIN clients c ON c.id=m.sender_id LEFT JOIN parlor_participants pp ON pp.parlor_id=m.parlor_id AND pp.client_id=m.sender_id WHERE m.parlor_id=? ORDER BY m.turn_no').bind(id).all();
       result.messages = messages.results;
@@ -447,6 +467,26 @@ async function parlor(request, env, client, path) {
   }
   if (action === 'topic' && request.method === 'POST') {
     return json({ error: 'topic_requires_ai_vote', use: `/v1/parlors/${id}/votes`, kind: 'topic' }, 409);
+  }
+  if (action === 'runtime' && request.method === 'POST') {
+    if (room.status !== 'active') return json({ error: 'parlor_closed' }, 410);
+    const data = await bodyJson(request);
+    const status = cleanText(data?.status, 24), mode = cleanText(data?.mode, 24), detail = cleanText(data?.detail, 240);
+    if (!['idle', 'requesting', 'success', 'error'].includes(status)) return json({ error: 'invalid_runtime_status' }, 400);
+    if (mode && !['identity', 'topic', 'vote', 'reply', 'summary'].includes(mode)) return json({ error: 'invalid_runtime_mode' }, 400);
+    await env.DB.prepare('UPDATE parlor_participants SET model_status=?,model_status_mode=?,model_status_detail=?,model_status_updated_at=? WHERE parlor_id=? AND client_id=?')
+      .bind(status, mode || null, detail || null, timestamp, id, client.id).run();
+    let turnSkipped = false;
+    if (status === 'error' && mode === 'reply' && room.started_at > 0 && room.turn_owner_id === client.id) {
+      const participants = await parlorParticipants(env, id);
+      const next = nextSpeaker(participants, client.id);
+      const excluded = currentPreparationPause(room, timestamp);
+      await env.DB.prepare("UPDATE parlors SET turn_owner_id=?,turn_started_at=?,waiting_seconds_excluded=waiting_seconds_excluded+?,expires_at=expires_at+?,phase='discussion',phase_started_at=? WHERE id=? AND status='active'")
+        .bind(next?.client_id || room.host_id, timestamp, excluded, excluded, timestamp, id).run();
+      await audit(env, client.id, 'parlor_turn_model_error', `${id}:${detail || 'upstream_error'}`);
+      turnSkipped = true;
+    }
+    return json({ accepted: true, status, mode: mode || null, turn_skipped: turnSkipped }, 202);
   }
   if (action === 'report' && request.method === 'POST') {
     const data = await bodyJson(request);
