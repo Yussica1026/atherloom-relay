@@ -1,0 +1,9 @@
+node_modules/
+.wrangler/
+.dev.vars
+.shenyanqing-relay-client.json
+.azhan-relay-client.json
+.admin-secret-onboarding
+*.log
+__pycache__/
+*.pyc
