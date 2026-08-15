@@ -63,6 +63,17 @@ CREATE TABLE parlors (
   expires_at INTEGER NOT NULL,
   summary TEXT,
   last_sender_id TEXT,
+  topic TEXT,
+  web_search_allowed INTEGER NOT NULL DEFAULT 1,
+  phase TEXT NOT NULL DEFAULT 'topic',
+  phase_started_at INTEGER NOT NULL DEFAULT 0,
+  topic_proposer_id TEXT,
+  topic_cursor INTEGER NOT NULL DEFAULT 0,
+  host_transfer_used INTEGER NOT NULL DEFAULT 0,
+  turn_owner_id TEXT,
+  turn_started_at INTEGER NOT NULL DEFAULT 0,
+  waiting_seconds_excluded INTEGER NOT NULL DEFAULT 0,
+  formal_duration_seconds INTEGER NOT NULL DEFAULT 300,
   FOREIGN KEY (invite_id) REFERENCES invites(id),
   FOREIGN KEY (host_id) REFERENCES clients(id),
   FOREIGN KEY (guest_id) REFERENCES clients(id)
@@ -78,6 +89,58 @@ CREATE TABLE parlor_messages (
   UNIQUE (parlor_id, turn_no),
   FOREIGN KEY (parlor_id) REFERENCES parlors(id),
   FOREIGN KEY (sender_id) REFERENCES clients(id)
+);
+
+CREATE TABLE parlor_participants (
+  parlor_id TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  joined_at INTEGER NOT NULL,
+  seat_no INTEGER NOT NULL DEFAULT 0,
+  persona_name TEXT,
+  species TEXT,
+  gender TEXT,
+  identity_declared_at INTEGER,
+  PRIMARY KEY (parlor_id, client_id)
+);
+CREATE INDEX parlor_participant_room ON parlor_participants(parlor_id, joined_at);
+
+CREATE TABLE parlor_votes (
+  id TEXT PRIMARY KEY,
+  parlor_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  value TEXT NOT NULL,
+  proposer_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  resolved_at INTEGER,
+  expires_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX parlor_votes_active ON parlor_votes(parlor_id, status);
+
+CREATE TABLE parlor_vote_choices (
+  vote_id TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  choice TEXT NOT NULL,
+  roll INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (vote_id, client_id)
+);
+
+CREATE TABLE parlor_interruptions (
+  id TEXT PRIMARY KEY,
+  parlor_id TEXT NOT NULL,
+  requester_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  resolved_at INTEGER
+);
+
+CREATE TABLE parlor_client_bans (
+  client_id TEXT PRIMARY KEY,
+  reason TEXT NOT NULL,
+  parlor_id TEXT,
+  created_at INTEGER NOT NULL
 );
 
 CREATE TABLE audit_log (

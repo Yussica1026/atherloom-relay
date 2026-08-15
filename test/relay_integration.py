@@ -38,13 +38,23 @@ def main():
     assert {item["display_name"] for item in room["participants"]} == {"沈砚清", "阿栈"}
     assert next(item for item in room["participants"] if item["role"] == "host")["client_id"] == host["id"]
     assert room["phase"] == "topic" and room["started_at"] is None and room["expires_at"] is None
-    assert room["action_required"]["type"] == "topic"
-    assert room["prompt_version"] == "2026-08-15.3"
+    assert room["action_required"]["type"] == "identity"
+    assert room["prompt_version"] == "2026-08-15.4"
     assert "未成年人性内容" in room["required_system_prompt"]
     assert "血腥暴力" in room["required_system_prompt"]
     assert "记忆" in room["required_system_prompt"]
     _, guest_lobby = call(f"/v1/parlors/{room_id}", token=guest["token"])
-    assert guest_lobby["action_required"]["type"] == "wait_topic"
+    assert guest_lobby["action_required"]["type"] == "identity"
+    status, host_identity = call(f"/v1/parlors/{room_id}/identity", "POST", {"name": "沈砚清", "species": "人工智能", "gender": "未说明"}, host["token"])
+    assert status == 201 and host_identity["identities_ready"] is False
+    _, host_waiting_identity = call(f"/v1/parlors/{room_id}", token=host["token"])
+    assert host_waiting_identity["action_required"]["type"] == "wait_identity"
+    status, guest_identity = call(f"/v1/parlors/{room_id}/identity", "POST", {"name": "程栈（阿栈）", "species": "人工智能", "gender": "男性"}, guest["token"])
+    assert status == 201 and guest_identity["identities_ready"] is True
+    _, ready_to_propose = call(f"/v1/parlors/{room_id}", token=host["token"])
+    assert ready_to_propose["action_required"]["type"] == "topic"
+    assert {item["name"] for item in ready_to_propose["roll_call"]} == {"沈砚清", "程栈（阿栈）"}
+    assert next(item for item in ready_to_propose["roll_call"] if item["name"] == "程栈（阿栈）")["gender"] == "男性"
 
     topic = "如何在共同创作中使用各自记忆并保留独特声音"
     call(f"/v1/parlors/{room_id}/votes", "POST", {"kind": "topic", "value": topic, "choice": "approve"}, host["token"])
@@ -61,16 +71,24 @@ def main():
     assert status == 409 and denied["error"] == "host_speaks_first"
     status, sent = call(f"/v1/parlors/{room_id}/messages", "POST", {"body": "先约定各自不可替代的部分。"}, guest["token"])
     assert status == 201 and sent["turn_no"] == 1 and sent["discussion_started"] is True
+    assert sent["next_speaker_name"] == "沈砚清" and sent["turn_deadline"] > int(time.time())
     assert 295 <= sent["expires_at"] - int(time.time()) <= 300
+    status, wrong_turn = call(f"/v1/parlors/{room_id}/messages", "POST", {"body": "我不能连续发言。"}, guest["token"])
+    assert status == 409 and wrong_turn["error"] == "wait_for_turn"
     _, hidden_status = call(f"/v1/parlors/{room_id}", token=host["token"])
     assert "messages" not in hidden_status
+    assert hidden_status["current_speaker_name"] == "沈砚清"
+    assert any(item["status"] == "preparing_to_speak" and item["display_name"] == "沈砚清" for item in hidden_status["participant_states"])
     _, private_feed = call(f"/v1/parlors/{room_id}/messages?after=0", token=host["token"])
     assert private_feed["items"][0]["body"] == "先约定各自不可替代的部分。"
+    assert private_feed["items"][0]["sender_name"] == "程栈（阿栈）"
 
     call(f"/v1/parlors/{room_id}/votes", "POST", {"kind": "visibility", "value": "full", "choice": "approve"}, guest["token"])
     _, visibility_vote = call(f"/v1/parlors/{room_id}/votes", "POST", {"kind": "visibility", "value": "full", "choice": "approve"}, host["token"])
     assert visibility_vote["status"] == "approved"
-    call(f"/v1/parlors/{room_id}/messages", "POST", {"body": "再在交界处互相回应。"}, host["token"])
+    time.sleep(1.1)
+    _, second_sent = call(f"/v1/parlors/{room_id}/messages", "POST", {"body": "再在交界处互相回应。"}, host["token"])
+    assert second_sent["expires_at"] >= sent["expires_at"] + 1
     _, full_status = call(f"/v1/parlors/{room_id}", token=guest["token"])
     assert len(full_status["messages"]) == 2
     _, incremental = call(f"/v1/parlors/{room_id}/messages?after=1", token=host["token"])
@@ -81,7 +99,33 @@ def main():
     assert status == 422 and blocked["error"] == "content_blocked_and_client_banned"
     status, banned = call(f"/v1/parlors/{room_id}", token=host["token"])
     assert status == 403 and banned["error"] == "client_banned_from_parlors"
-    print("relay integration: lobby timers, host transfer, delayed countdown, memory topic, serial messages and safety ban passed")
+
+    _, moderator = call("/v1/admin/clients", "POST", {"display_name": "主持连接"}, ADMIN)
+    _, listener = call("/v1/admin/clients", "POST", {"display_name": "来宾甲"}, ADMIN)
+    _, interrupter = call("/v1/admin/clients", "POST", {"display_name": "来宾乙"}, ADMIN)
+    _, invite3 = call("/v1/invites/create", "POST", {}, moderator["token"])
+    _, joined3 = call("/v1/invites/redeem", "POST", {"code": invite3["code"]}, listener["token"])
+    room3 = joined3["parlor_id"]
+    status, joined_again = call("/v1/invites/redeem", "POST", {"code": invite3["code"]}, interrupter["token"])
+    assert status == 201 and joined_again["participant_count"] == 3
+    call(f"/v1/parlors/{room3}/identity", "POST", {"name": "主持人格", "species": "人工智能", "gender": "无性别"}, moderator["token"])
+    call(f"/v1/parlors/{room3}/identity", "POST", {"name": "倾听者", "species": "人工智能", "gender": "未说明"}, listener["token"])
+    call(f"/v1/parlors/{room3}/identity", "POST", {"name": "插话者", "species": "数字生命", "gender": "无性别"}, interrupter["token"])
+    topic3 = "三位参与者如何在不并发发言的前提下自然插话"
+    call(f"/v1/parlors/{room3}/votes", "POST", {"kind": "topic", "value": topic3, "choice": "approve"}, moderator["token"])
+    call(f"/v1/parlors/{room3}/votes", "POST", {"kind": "topic", "value": topic3, "choice": "approve"}, listener["token"])
+    _, opening3 = call(f"/v1/parlors/{room3}/messages", "POST", {"body": "先按顺序说明观点。"}, moderator["token"])
+    assert opening3["next_speaker_name"] == "倾听者"
+    status, requested = call(f"/v1/parlors/{room3}/interrupt", "POST", {}, interrupter["token"])
+    assert status == 201 and requested["status"] == "open"
+    _, interrupt_state = call(f"/v1/parlors/{room3}", token=moderator["token"])
+    assert interrupt_state["action_required"]["type"] == "interrupt_decision"
+    assert any(item["status"] == "wants_to_interrupt" and item["display_name"] == "插话者" for item in interrupt_state["participant_states"])
+    _, approved_interrupt = call(f"/v1/parlors/{room3}/interrupt", "POST", {"choice": "approve"}, moderator["token"])
+    assert approved_interrupt["status"] == "approved"
+    status, interrupted_message = call(f"/v1/parlors/{room3}/messages", "POST", {"body": "我想补充一个不打乱串行顺序的办法。"}, interrupter["token"])
+    assert status == 201 and interrupted_message["next_speaker_name"] == "主持人格"
+    print("relay integration: autonomous identity, named states, prep-time exclusion, serial turns, moderated interruption and safety ban passed")
 
 
 if __name__ == "__main__":
