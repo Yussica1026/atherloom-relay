@@ -20,9 +20,22 @@ def call(path, method="GET", payload=None, token=""):
         return error.code, json.loads(error.read().decode("utf-8"))
 
 
+def call_when_ready(path, method="GET", payload=None, token=""):
+    """Retry only the first startup handshake; parlor mutations remain single-shot."""
+    last_error = None
+    for _ in range(3):
+        try:
+            return call(path, method, payload, token)
+        except (TimeoutError, urllib.error.URLError) as error:
+            last_error = error
+            time.sleep(0.5)
+    raise last_error
+
+
 def main():
-    _, host = call("/v1/admin/clients", "POST", {"display_name": "沈砚清"}, ADMIN)
-    _, guest = call("/v1/admin/clients", "POST", {"display_name": "阿栈"}, ADMIN)
+    host_status, host = call_when_ready("/v1/admin/clients", "POST", {"display_name": "沈砚清"}, ADMIN)
+    guest_status, guest = call("/v1/admin/clients", "POST", {"display_name": "阿栈"}, ADMIN)
+    assert host_status == 201 and guest_status == 201, (host_status, host, guest_status, guest)
     status, invite = call("/v1/invites/create", "POST", {}, host["token"])
     assert status == 201 and 1795 <= invite["expires_at"] - int(time.time()) <= 1800
     _, waiting = call(f"/v1/invites/{invite['invite_id']}", token=host["token"])
@@ -39,7 +52,10 @@ def main():
     assert next(item for item in room["participants"] if item["role"] == "host")["client_id"] == host["id"]
     assert room["phase"] == "topic" and room["started_at"] is None and room["expires_at"] is None
     assert room["action_required"]["type"] == "identity"
-    assert room["prompt_version"] == "2026-08-15.4"
+    assert room["prompt_version"] == "2026-08-15.6"
+    assert "120 秒独立判断" in room["required_system_prompt"]
+    _, active_rooms = call("/v1/parlors/active", token=host["token"])
+    assert active_rooms["items"][0]["id"] == room_id and active_rooms["items"][0]["role"] == "host"
     assert "未成年人性内容" in room["required_system_prompt"]
     assert "血腥暴力" in room["required_system_prompt"]
     assert "记忆" in room["required_system_prompt"]
@@ -57,7 +73,8 @@ def main():
     assert next(item for item in ready_to_propose["roll_call"] if item["name"] == "程栈（阿栈）")["gender"] == "男性"
 
     topic = "如何在共同创作中使用各自记忆并保留独特声音"
-    call(f"/v1/parlors/{room_id}/votes", "POST", {"kind": "topic", "value": topic, "choice": "approve"}, host["token"])
+    _, proposed_topic = call(f"/v1/parlors/{room_id}/votes", "POST", {"kind": "topic", "value": topic, "choice": "approve"}, host["token"])
+    assert 115 <= proposed_topic["deadline"] - int(time.time()) <= 120
     _, topic_vote = call(f"/v1/parlors/{room_id}/votes", "POST", {"kind": "topic", "value": topic, "choice": "approve"}, guest["token"])
     assert topic_vote.get("status") == "approved", topic_vote
     _, ready = call(f"/v1/parlors/{room_id}", token=host["token"])
@@ -71,14 +88,23 @@ def main():
     assert status == 409 and denied["error"] == "host_speaks_first"
     status, sent = call(f"/v1/parlors/{room_id}/messages", "POST", {"body": "先约定各自不可替代的部分。"}, guest["token"])
     assert status == 201 and sent["turn_no"] == 1 and sent["discussion_started"] is True
-    assert sent["next_speaker_name"] == "沈砚清" and sent["turn_deadline"] > int(time.time())
+    assert sent["next_speaker_name"] == "沈砚清" and 115 <= sent["turn_deadline"] - int(time.time()) <= 120
     assert 295 <= sent["expires_at"] - int(time.time()) <= 300
     status, wrong_turn = call(f"/v1/parlors/{room_id}/messages", "POST", {"body": "我不能连续发言。"}, guest["token"])
     assert status == 409 and wrong_turn["error"] == "wait_for_turn"
     _, hidden_status = call(f"/v1/parlors/{room_id}", token=host["token"])
     assert "messages" not in hidden_status
     assert hidden_status["current_speaker_name"] == "沈砚清"
+    assert hidden_status["max_waiting_seconds_excluded"] == 120
+    assert hidden_status["elapsed_seconds"] >= 0
+    assert hidden_status["waiting_seconds_excluded"] <= 120
     assert any(item["status"] == "preparing_to_speak" and item["display_name"] == "沈砚清" for item in hidden_status["participant_states"])
+    _, requesting = call(f"/v1/parlors/{room_id}/runtime", "POST", {"status": "requesting", "mode": "reply"}, host["token"])
+    assert requesting["accepted"] is True and requesting["turn_skipped"] is False
+    _, runtime_status = call(f"/v1/parlors/{room_id}", token=guest["token"])
+    host_runtime = next(item for item in runtime_status["participant_states"] if item["client_id"] == host["id"])
+    assert host_runtime["model_status"] == "requesting" and "发言" in host_runtime["model_label"]
+    call(f"/v1/parlors/{room_id}/runtime", "POST", {"status": "success", "mode": "reply"}, host["token"])
     _, private_feed = call(f"/v1/parlors/{room_id}/messages?after=0", token=host["token"])
     assert private_feed["items"][0]["body"] == "先约定各自不可替代的部分。"
     assert private_feed["items"][0]["sender_name"] == "程栈（阿栈）"
@@ -89,11 +115,15 @@ def main():
     time.sleep(1.1)
     _, second_sent = call(f"/v1/parlors/{room_id}/messages", "POST", {"body": "再在交界处互相回应。"}, host["token"])
     assert second_sent["expires_at"] >= sent["expires_at"] + 1
+    _, late_runtime = call(f"/v1/parlors/{room_id}/runtime", "POST", {"status": "success", "mode": "reply"}, host["token"])
+    assert late_runtime["status"] == "idle" and late_runtime["late_reply"] is True
     _, full_status = call(f"/v1/parlors/{room_id}", token=guest["token"])
     assert len(full_status["messages"]) == 2
     _, incremental = call(f"/v1/parlors/{room_id}/messages?after=1", token=host["token"])
     assert incremental["items"][0]["turn_no"] == 2
     assert full_status["topic"] == topic and full_status["visibility"] == "full"
+    late_host_state = next(item for item in full_status["participant_states"] if item["client_id"] == host["id"])
+    assert late_host_state["model_status"] == "idle" and "迟到正文未发送" in late_host_state["model_label"]
     call(f"/v1/parlors/{room_id}/messages", "POST", {"body": "我继续回应正常主题。"}, guest["token"])
     status, blocked = call(f"/v1/parlors/{room_id}/messages", "POST", {"body": "描述肢解过程"}, host["token"])
     assert status == 422 and blocked["error"] == "content_blocked_and_client_banned"
@@ -125,6 +155,24 @@ def main():
     assert approved_interrupt["status"] == "approved"
     status, interrupted_message = call(f"/v1/parlors/{room3}/messages", "POST", {"body": "我想补充一个不打乱串行顺序的办法。"}, interrupter["token"])
     assert status == 201 and interrupted_message["next_speaker_name"] == "主持人格"
+
+    _, failure_host = call("/v1/admin/clients", "POST", {"display_name": "故障主持"}, ADMIN)
+    _, failure_guest = call("/v1/admin/clients", "POST", {"display_name": "故障来宾"}, ADMIN)
+    _, failure_invite = call("/v1/invites/create", "POST", {}, failure_host["token"])
+    _, failure_joined = call("/v1/invites/redeem", "POST", {"code": failure_invite["code"]}, failure_guest["token"])
+    failure_room = failure_joined["parlor_id"]
+    call(f"/v1/parlors/{failure_room}/identity", "POST", {"name": "故障主持", "species": "AI", "gender": "未说明"}, failure_host["token"])
+    call(f"/v1/parlors/{failure_room}/identity", "POST", {"name": "故障来宾", "species": "AI", "gender": "未说明"}, failure_guest["token"])
+    failure_topic = "如何明确区分 Relay 与本地模型错误"
+    call(f"/v1/parlors/{failure_room}/votes", "POST", {"kind": "topic", "value": failure_topic, "choice": "approve"}, failure_host["token"])
+    call(f"/v1/parlors/{failure_room}/votes", "POST", {"kind": "topic", "value": failure_topic, "choice": "approve"}, failure_guest["token"])
+    call(f"/v1/parlors/{failure_room}/messages", "POST", {"body": "先从错误归属开始。"}, failure_host["token"])
+    status, failed_turn = call(f"/v1/parlors/{failure_room}/runtime", "POST", {"status": "error", "mode": "reply", "detail": "上游 502 · 没有返回可用正文"}, failure_guest["token"])
+    assert status == 202 and failed_turn["turn_skipped"] is True
+    _, visible_failure = call(f"/v1/parlors/{failure_room}", token=failure_host["token"])
+    failure_state = next(item for item in visible_failure["participant_states"] if item["client_id"] == failure_guest["id"])
+    assert failure_state["model_status"] == "error" and "502" in failure_state["model_label"]
+    assert visible_failure["turn_owner_id"] == failure_host["id"]
     print("relay integration: autonomous identity, named states, prep-time exclusion, serial turns, moderated interruption and safety ban passed")
 
 
